@@ -58,6 +58,7 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -1502,6 +1503,8 @@ static int tcp_rpcs_ext_drs_alarm (connection_job_t C) {
 }
 
 int tcp_rpcs_ext_init_accepted (connection_job_t C) {
+  int one = 1;
+  setsockopt(CONN_INFO(C)->fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
   job_timer_insert (C, precise_now + 10);
   return tcp_rpcs_init_accepted_nohs (C);
 }
@@ -1742,12 +1745,30 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         sha256_hmac (ext_secret[secret_id], 16, buffer, 32 + response_size, server_random);
         memcpy (response_buffer + 11, server_random, 32);
 
-        struct raw_message *m = calloc (sizeof (struct raw_message), 1);
-        rwm_create (m, response_buffer, response_size);
-        mpq_push_w (c->out_queue, m, 0);
-        job_signal (JOB_REF_CREATE_PASS (C), JS_RUN);
+        /* Profile A:
+           split first flight into:
+           1) ServerHello record only (127 bytes)
+           2) CCS + AppData
+        */
+        {
+          const int first_chunk = 127;
 
-        free (buffer);
+          struct raw_message *m1 = calloc(sizeof(*m1), 1);
+          assert(m1 != NULL);
+          rwm_create(m1, response_buffer, first_chunk);
+          mpq_push_w(c->out_queue, m1, 0);
+          job_signal(JOB_REF_CREATE_PASS(C), JS_RUN);
+
+          if (response_size > first_chunk) {
+            struct raw_message *m2 = calloc(sizeof(*m2), 1);
+            assert(m2 != NULL);
+            rwm_create(m2, response_buffer + first_chunk, response_size - first_chunk);
+            mpq_push_w(c->out_queue, m2, 0);
+            job_signal(JOB_REF_CREATE_PASS(C), JS_RUN);
+          }
+        }
+
+        free(buffer);
         return 11; // waiting for dummy ChangeCipherSpec and first packet
       }
 
